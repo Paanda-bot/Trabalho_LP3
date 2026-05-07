@@ -3,84 +3,84 @@ package batalhanaval.servidor;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
-import java.util.HashMap;
-import java.util.Map;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Ponto de entrada do Servidor de Batalha Naval.
- *
- * O servidor:
- *  1. Abre um ServerSocket na porta indicada (padrão: 12345)
- *  2. Aceita ligações de clientes num loop infinito
- *  3. Cada par de clientes é gerido por um GestorJogo dedicado (nova Thread)
+ * ╔══════════════════════════════════════════════════════════╗
+ * ║              BATALHA NAVAL — SERVIDOR                    ║
+ * ║  Aceita pares de clientes e lança um GestorJogo por par  ║
+ * ╚══════════════════════════════════════════════════════════╝
  *
  * Utilização:
- *   java -jar BatalhaNaval-servidor.jar [porta]
+ *   java -cp ... batalhanaval.servidor.ServidorMain [porta]
  *
- * Exemplo:
- *   java -jar BatalhaNaval-servidor.jar 12345
+ * Dentro do NetBeans:
+ *   Botão direito no projecto → Run Maven → "▶ Correr Servidor"
  */
 public class ServidorMain {
 
-    /** Porta padrão do servidor */
     public static final int PORTA_PADRAO = 12345;
 
-    /**
-     * Mapa de jogos activos: idJogo → GestorJogo
-     * Permite que um cliente se reconecte a um jogo em curso.
-     */
-    private static final Map<String, GestorJogo> jogosActivos = new HashMap<>();
+    // Cores ANSI para o log do servidor
+    static final String RESET  = "\u001B[0m";
+    static final String BOLD   = "\u001B[1m";
+    static final String CYAN   = "\u001B[36m";
+    static final String GREEN  = "\u001B[32m";
+    static final String YELLOW = "\u001B[33m";
+    static final String RED    = "\u001B[31m";
+    static final String DIM    = "\u001B[2m";
 
-    public static void main(String[] args) {
-        // Lê a porta dos argumentos ou usa a porta padrão
+    private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
+
+    /** Mapa de jogos activos: idJogo → GestorJogo */
+    static final ConcurrentHashMap<String, GestorJogo> jogosActivos = new ConcurrentHashMap<>();
+
+    public static void main(String[] args) throws IOException {
         int porta = PORTA_PADRAO;
         if (args.length > 0) {
-            try {
-                porta = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.out.println("[SERVIDOR] Porta inválida, a usar " + PORTA_PADRAO);
-            }
+            try { porta = Integer.parseInt(args[0]); }
+            catch (NumberFormatException ignored) {}
         }
 
-        System.out.println("╔══════════════════════════════════════╗");
-        System.out.println("║      BATALHA NAVAL - SERVIDOR        ║");
-        System.out.println("╚══════════════════════════════════════╝");
-        System.out.println("[SERVIDOR] A iniciar na porta " + porta + "...");
+        banner(porta);
 
         try (ServerSocket serverSocket = new ServerSocket(porta)) {
-            System.out.println("[SERVIDOR] À espera de ligações...");
-
-            // Loop principal: aceita dois clientes de cada vez para um jogo
             while (true) {
-                System.out.println("[SERVIDOR] À espera do Jogador 1...");
-                Socket jogador1 = serverSocket.accept();
-                System.out.println("[SERVIDOR] Jogador 1 ligado: " + jogador1.getInetAddress());
+                log(CYAN, "Aguardando Jogador 1...");
+                Socket j1 = serverSocket.accept();
+                log(GREEN, "Jogador 1 ligado: " + j1.getInetAddress().getHostAddress());
 
-                System.out.println("[SERVIDOR] À espera do Jogador 2...");
-                Socket jogador2 = serverSocket.accept();
-                System.out.println("[SERVIDOR] Jogador 2 ligado: " + jogador2.getInetAddress());
+                log(CYAN, "Aguardando Jogador 2...");
+                Socket j2 = serverSocket.accept();
+                log(GREEN, "Jogador 2 ligado: " + j2.getInetAddress().getHostAddress());
 
-                // Cria um gestor para este par de jogadores e lança numa thread
-                GestorJogo gestor = new GestorJogo(jogador1, jogador2, jogosActivos);
-                Thread t = new Thread(gestor);
-                t.setName("Jogo-" + gestor.getIdJogo());
-                t.setDaemon(true); // Thread daemon: termina com o servidor
+                GestorJogo gestor = new GestorJogo(j1, j2);
+                jogosActivos.put(gestor.getIdJogo(), gestor);
+
+                Thread t = new Thread(gestor, "Jogo-" + gestor.getIdJogo());
+                t.setDaemon(true);
                 t.start();
-
-                System.out.println("[SERVIDOR] Jogo " + gestor.getIdJogo() + " iniciado.");
+                log(YELLOW, "Jogo " + BOLD + gestor.getIdJogo() + RESET + YELLOW + " iniciado!");
             }
-        } catch (IOException e) {
-            System.err.println("[SERVIDOR] Erro ao iniciar: " + e.getMessage());
         }
     }
 
-    /** Regista um jogo activo no mapa global */
-    public static synchronized void registarJogo(String idJogo, GestorJogo gestor) {
-        jogosActivos.put(idJogo, gestor);
+    /** Formata e imprime uma linha de log do servidor */
+    public static void log(String cor, String msg) {
+        System.out.println(DIM + "[" + LocalTime.now().format(FMT) + "] " + RESET
+                         + cor + "[SERVIDOR] " + msg + RESET);
     }
 
-    /** Remove um jogo do mapa quando termina */
-    public static synchronized void removerJogo(String idJogo) {
-        jogosActivos.remove(idJogo);
+    private static void banner(int porta) {
+        System.out.println(BOLD + CYAN);
+        System.out.println("  ╔══════════════════════════════════════════════╗");
+        System.out.println("  ║     ⚓  BATALHA NAVAL — SERVIDOR  ⚓          ║");
+        System.out.println("  ╠══════════════════════════════════════════════╣");
+        System.out.printf( "  ║  Porta: %-37d║%n", porta);
+        System.out.println("  ║  Aguardando ligações...                      ║");
+        System.out.println("  ╚══════════════════════════════════════════════╝");
+        System.out.println(RESET);
     }
 }

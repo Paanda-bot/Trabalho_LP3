@@ -3,57 +3,55 @@
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <modelVersion>4.0.0</modelVersion>
-
-    <!-- Identificação do projeto Maven -->
     <groupId>batalhanaval</groupId>
     <artifactId>BatalhaNaval</artifactId>
     <version>1.0-SNAPSHOT</version>
     <packaging>jar</packaging>
 
     <properties>
-        <!-- Versão do Java usada (Java 11+ recomendado) -->
         <maven.compiler.source>11</maven.compiler.source>
         <maven.compiler.target>11</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <argLine>-Dfile.encoding=UTF-8 -Dstdout.encoding=UTF-8</argLine>
     </properties>
 
     <build>
         <plugins>
-            <!-- Plugin para criar dois JARs executáveis separados: servidor e cliente -->
+            <!--
+              Plugin exec: permite correr as três main classes directamente no NetBeans
+              sem precisar de JARs. Basta clicar com botão direito → Run Maven → escolher
+              um dos goals abaixo (ou usar o botão Play com a config correspondente).
+
+              Goals disponíveis (adicionados em nbactions.xml):
+                mvn exec:java -Dexec.mainClass="batalhanaval.launcher.LauncherIDE"   ← RECOMENDADO
+                mvn exec:java -Dexec.mainClass="batalhanaval.servidor.ServidorMain"
+                mvn exec:java -Dexec.mainClass="batalhanaval.cliente.ClienteMain"
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <!-- Classe padrão ao clicar "Run Project" no NetBeans -->
+                    <mainClass>batalhanaval.launcher.LauncherIDE</mainClass>
+                    <arguments>
+                      <argument>-Dfile.encoding=UTF-8</argument>
+                      <argument>-Dstdout.encoding=UTF-8</argument>
+                    </arguments>
+                </configuration>
+            </plugin>
+
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-jar-plugin</artifactId>
                 <version>3.3.0</version>
-                <executions>
-                    <!-- JAR do Servidor -->
-                    <execution>
-                        <id>servidor-jar</id>
-                        <phase>package</phase>
-                        <goals><goal>jar</goal></goals>
-                        <configuration>
-                            <classifier>servidor</classifier>
-                            <archive>
-                                <manifest>
-                                    <mainClass>batalhanaval.servidor.ServidorMain</mainClass>
-                                </manifest>
-                            </archive>
-                        </configuration>
-                    </execution>
-                    <!-- JAR do Cliente -->
-                    <execution>
-                        <id>cliente-jar</id>
-                        <phase>package</phase>
-                        <goals><goal>jar</goal></goals>
-                        <configuration>
-                            <classifier>cliente</classifier>
-                            <archive>
-                                <manifest>
-                                    <mainClass>batalhanaval.cliente.ClienteMain</mainClass>
-                                </manifest>
-                            </archive>
-                        </configuration>
-                    </execution>
-                </executions>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>batalhanaval.launcher.LauncherIDE</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
             </plugin>
         </plugins>
     </build>

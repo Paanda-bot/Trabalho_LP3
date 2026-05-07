@@ -7,105 +7,97 @@ import java.io.*;
 import java.net.Socket;
 
 /**
- * Gere a ligação ao servidor via Socket.
+ * ══════════════════════════════════════════════════════════
+ *  LigacaoServidor — gere a ligação TCP ao servidor
+ * ══════════════════════════════════════════════════════════
  *
- * Esta classe corre numa Thread dedicada para ler mensagens do servidor
- * sem bloquear a interface do cliente.
+ * UML:
+ *   LigacaoServidor
+ *   ─────────────────────────────────────────────────────
+ *   - socket: Socket
+ *   - out: PrintWriter
+ *   - callback: MensagemCallback
+ *   ─────────────────────────────────────────────────────
+ *   + enviar(Mensagem): void
+ *   + fechar(): void
+ *   + isLigado(): boolean
  *
- * Modelo de concorrência:
- *  - A thread principal do cliente: trata do input do utilizador e envia mensagens
- *  - Esta thread (LeitorServidor): lê mensagens recebidas do servidor e chama callbacks
+ *   [interface] MensagemCallback
+ *   + onMensagemRecebida(Mensagem): void
  *
- * Usando uma interface (Callback) para notificar o InterfaceCLI quando chegam mensagens,
- * tornando o código desacoplado.
+ *   [inner class] LeitorServidor implements Runnable
+ *   Lê linhas do socket em loop e chama o callback.
+ *   Corre numa Thread separada para não bloquear a UI.
+ *
+ * Por que precisamos de uma Thread aqui?
+ *   → BufferedReader.readLine() bloqueia até chegar uma linha.
+ *     Se a UI (InterfaceCLI) ficasse à espera do socket, não conseguia
+ *     ler input do utilizador ao mesmo tempo. Com uma Thread dedicada
+ *     apenas à leitura, a UI mantém-se sempre responsiva.
  */
-public class LigacaoServidor implements Runnable {
+public class LigacaoServidor {
 
-    private Socket socket;
-    private PrintWriter out;
-    private BufferedReader in;
-    private final MensagemCallback callback;
-    private volatile boolean activo = true;
-
-    /**
-     * Interface de callback: chamada quando chega uma mensagem do servidor.
-     * O InterfaceCLI implementa esta interface para reagir às mensagens.
-     */
+    /** Interface de callback — a CLI implementa esta interface */
     public interface MensagemCallback {
-        void onMensagemRecebida(Mensagem mensagem);
-        void onDesconexao();
+        void onMensagemRecebida(Mensagem msg);
     }
 
-    /**
-     * Constrói a ligação ao servidor.
-     *
-     * @param host     endereço IP ou hostname do servidor
-     * @param porta    porta do servidor
-     * @param callback callback para processar mensagens recebidas
-     * @throws IOException se não conseguir ligar
-     */
-    public LigacaoServidor(String host, int porta, MensagemCallback callback) throws IOException {
+    private final Socket           socket;
+    private final PrintWriter      out;
+    private final MensagemCallback callback;
+    private volatile boolean       ligado = true;
+
+    public LigacaoServidor(String host, int porta, MensagemCallback callback)
+            throws IOException {
+        this.socket   = new Socket(host, porta);
+        this.out      = new PrintWriter(new BufferedWriter(
+                         new OutputStreamWriter(socket.getOutputStream())), true);
         this.callback = callback;
-        this.socket = new Socket(host, porta);
-        this.out = new PrintWriter(
-                new BufferedWriter(new OutputStreamWriter(socket.getOutputStream())), true);
-        this.in = new BufferedReader(
-                new InputStreamReader(socket.getInputStream()));
-        System.out.println("[CLIENTE] Ligado a " + host + ":" + porta);
+
+        // Lança a thread de leitura como daemon (termina quando a JVM terminar)
+        Thread leitor = new Thread(new LeitorServidor(), "LeitorServidor");
+        leitor.setDaemon(true);
+        leitor.start();
     }
 
-    /**
-     * Loop de leitura: corre numa Thread dedicada e lê mensagens continuamente.
-     * Cada mensagem recebida é passada ao callback para ser processada pelo cliente.
-     */
-    @Override
-    public void run() {
-        try {
-            String linha;
-            while (activo && (linha = in.readLine()) != null) {
-                Mensagem msg = Mensagem.deserializar(linha);
-                if (msg != null && callback != null) {
-                    callback.onMensagemRecebida(msg);
+    /** Envia uma mensagem ao servidor */
+    public void enviar(Mensagem msg) {
+        if (ligado && out != null) out.println(msg.serializar());
+    }
+
+    /** Envia mensagem simples sem dados */
+    public void enviar(TipoMensagem tipo) { enviar(new Mensagem(tipo)); }
+
+    /** Fecha a ligação */
+    public void fechar() {
+        ligado = false;
+        try { if (socket != null) socket.close(); } catch (IOException ignored) {}
+    }
+
+    public boolean isLigado() { return ligado && !socket.isClosed(); }
+
+    // ── Thread de leitura ────────────────────────────────────────────────────
+
+    private class LeitorServidor implements Runnable {
+        @Override
+        public void run() {
+            try (BufferedReader in = new BufferedReader(
+                     new InputStreamReader(socket.getInputStream()))) {
+                String linha;
+                while (ligado && (linha = in.readLine()) != null) {
+                    Mensagem msg = Mensagem.deserializar(linha);
+                    if (msg != null) callback.onMensagemRecebida(msg);
                 }
-            }
-        } catch (IOException e) {
-            if (activo) {
-                System.err.println("[CLIENTE] Ligação perdida: " + e.getMessage());
-            }
-        } finally {
-            if (callback != null) {
-                callback.onDesconexao();
+            } catch (IOException e) {
+                if (ligado) {
+                    // Ligação perdida inesperadamente
+                    callback.onMensagemRecebida(
+                        new Mensagem(TipoMensagem.ADVERSARIO_DESLIGADO,
+                                     "Ligação perdida: " + e.getMessage()));
+                }
+            } finally {
+                ligado = false;
             }
         }
     }
-
-    /**
-     * Envia uma mensagem ao servidor.
-     *
-     * @param tipo  tipo da mensagem
-     * @param dados dados da mensagem
-     */
-    public void enviarMensagem(TipoMensagem tipo, String dados) {
-        if (out != null) {
-            Mensagem msg = new Mensagem(tipo, dados);
-            out.println(msg.serializar());
-        }
-    }
-
-    /**
-     * Envia uma mensagem sem dados ao servidor.
-     */
-    public void enviarMensagem(TipoMensagem tipo) {
-        enviarMensagem(tipo, "");
-    }
-
-    /** Termina a ligação ao servidor */
-    public void desligar() {
-        activo = false;
-        try {
-            if (socket != null) socket.close();
-        } catch (IOException ignored) {}
-    }
-
-    public boolean isActivo() { return activo && socket != null && socket.isConnected(); }
 }

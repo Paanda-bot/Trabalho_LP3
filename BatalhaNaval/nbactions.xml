@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Ficheiro de acções do NetBeans.
+  Define o que acontece quando carregas em Run Project, Debug, etc.
+  Coloca este ficheiro na raiz do projecto (junto ao pom.xml).
+-->
+<actions>
+    <!-- F6 / Run Project → Launcher IDE (servidor + 2 clientes na mesma JVM) -->
+    <action>
+        <actionName>run</actionName>
+        <goals>
+            <goal>compile</goal>
+            <goal>exec:java</goal>
+        </goals>
+        <properties>
+            <exec.mainClass>batalhanaval.launcher.LauncherIDE</exec.mainClass>
+        </properties>
+    </action>
+
+    <!-- Acção personalizada: "Servidor" -->
+    <action>
+        <actionName>CUSTOM-run-servidor</actionName>
+        <displayName>▶ Correr Servidor</displayName>
+        <goals>
+            <goal>compile</goal>
+            <goal>exec:java</goal>
+        </goals>
+        <properties>
+            <exec.mainClass>batalhanaval.servidor.ServidorMain</exec.mainClass>
+        </properties>
+    </action>
+
+    <!-- Acção personalizada: "Cliente" -->
+    <action>
+        <actionName>CUSTOM-run-cliente</actionName>
+        <displayName>▶ Correr Cliente</displayName>
+        <goals>
+            <goal>compile</goal>
+            <goal>exec:java</goal>
+        </goals>
+        <properties>
+            <exec.mainClass>batalhanaval.cliente.ClienteMain</exec.mainClass>
+        </properties>
+    </action>
+</actions>

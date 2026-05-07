@@ -1,341 +1,461 @@
 package batalhanaval.cliente;
 
+import batalhanaval.jogo.Tabuleiro;
 import batalhanaval.jogo.TipoNavio;
 import batalhanaval.protocolo.Mensagem;
 import batalhanaval.protocolo.TipoMensagem;
 import batalhanaval.util.UtilNavio;
 
-import java.util.Scanner;
+import java.util.*;
 
 /**
- * Interface de linha de comandos (CLI) para o cliente da Batalha Naval.
+ * ╔══════════════════════════════════════════════════════════════╗
+ * ║   InterfaceCLI — Interface de linha de comandos do cliente   ║
+ * ║   Rica em ANSI, responsiva por threads, com UX completa      ║
+ * ╚══════════════════════════════════════════════════════════════╝
  *
- * Esta classe:
- *  1. Implementa LigacaoServidor.MensagemCallback para receber mensagens do servidor
- *  2. Gere o estado local da interface (que fase está o cliente)
- *  3. Apresenta os menus e lê input do utilizador
- *  4. Envia mensagens ao servidor via LigacaoServidor
+ * UML:
+ *   InterfaceCLI implements LigacaoServidor.MensagemCallback
+ *   ──────────────────────────────────────────────────────────────
+ *   - host, porta: String/int
+ *   - ligacao: LigacaoServidor
+ *   - scanner: Scanner
+ *   - fase: Fase  (volatile — lida por duas threads)
+ *   - tabProprio, tabAdversario: Tabuleiro
+ *   - numJogador, tirosRestantes: int
+ *   - ultimaMensagem: String
+ *   ──────────────────────────────────────────────────────────────
+ *   + iniciar(): void
+ *   + onMensagemRecebida(Mensagem): void   ← callback (thread do socket)
+ *   - fasePosicionamento(): void
+ *   - faseJogo(): void
+ *   - renderUI(): void                     ← re-desenha a consola completa
  *
- * O fluxo é:
- *   LIGAR → POSICIONAMENTO → AGUARDAR → JOGO → FIM
+ * Sincronização:
+ *   → 'fase' é volatile: a thread do socket escreve, a thread principal lê
+ *   → O Object 'lock' serve de monitor para wait()/notifyAll():
+ *       thread principal faz lock.wait() quando não é seu turno
+ *       thread do socket faz lock.notifyAll() quando a fase muda
+ *   → Os tabuleiros são actualizados só pela thread do socket (sem concorrência)
  */
 public class InterfaceCLI implements LigacaoServidor.MensagemCallback {
 
-    /** Ligação ao servidor */
-    private final LigacaoServidor ligacao;
+    // ── Cores ANSI ────────────────────────────────────────────────────────────
+    static final String RESET  = "\u001B[0m";
+    static final String BOLD   = "\u001B[1m";
+    static final String DIM    = "\u001B[2m";
+    static final String BLUE   = "\u001B[34m";
+    static final String CYAN   = "\u001B[36m";
+    static final String GREEN  = "\u001B[32m";
+    static final String RED    = "\u001B[31m";
+    static final String YELLOW = "\u001B[33m";
+    static final String WHITE  = "\u001B[37m";
+    static final String MAGENTA= "\u001B[35m";
+    static final String BG_CYAN= "\u001B[46m";
 
-    /** Scanner para ler input do utilizador */
+    // ── Estado ────────────────────────────────────────────────────────────────
+    private final String  host;
+    private final int     porta;
+    private final int     idLauncher;       // 0 = standalone, 1/2 = dentro do LauncherIDE
+    private LigacaoServidor ligacao;
     private final Scanner scanner = new Scanner(System.in);
 
-    /** Número deste jogador (1 ou 2), atribuído pelo servidor */
-    private int numeroJogador = 0;
+    private enum Fase { AGUARDAR_LIGACAO, POSICIONAMENTO, AGUARDAR_ADV, JOGO_MEU_TURNO,
+                        JOGO_TURNO_ADV, FIM, ERRO }
+    private volatile Fase   fase       = Fase.AGUARDAR_LIGACAO;
+    private final Object     lock       = new Object(); // monitor para wait/notify
 
-    /** ID do jogo actual */
-    private String idJogo = "";
+    private int              numJogador  = 0;
+    private String           idJogo      = "";
+    private int              tirosRestantes = 0;
+    private volatile String  ultimaMensagem = "";
+    private volatile String  tabuleirosTexto = "";  // recebido do servidor
+    private final Tabuleiro  tabLocal    = new Tabuleiro(); // usado para render local rico
 
-    /** Flag: é o meu turno? */
-    private volatile boolean meuTurno = false;
+    // Contagem local dos navios ainda por posicionar
+    private final Map<TipoNavio, Integer> naviosPorPosicionar = new LinkedHashMap<>();
 
-    /** Fase actual da interface */
-    private volatile Fase faseActual = Fase.POSICIONAMENTO;
+    public InterfaceCLI(String host, int porta, int idLauncher) {
+        this.host       = host;
+        this.porta      = porta;
+        this.idLauncher = idLauncher;
+        for (TipoNavio t : TipoNavio.values()) naviosPorPosicionar.put(t, t.getQuantidade());
+    }
 
-    /** Último estado dos tabuleiros recebido */
-    private volatile String ultimoEstadoTabuleiros = "";
+    // ── Entrada principal ─────────────────────────────────────────────────────
 
-    private enum Fase { POSICIONAMENTO, AGUARDAR, JOGO, FIM }
-
-    /**
-     * Tipos de navios ainda por colocar (controla o fluxo de posicionamento)
-     * Índice: mesmo que TipoNavio.values()
-     */
-    private int[] naviosRestantes;
-
-    public InterfaceCLI(LigacaoServidor ligacao) {
-        this.ligacao = ligacao;
-        // Inicializa os navios restantes conforme TipoNavio
-        TipoNavio[] tipos = TipoNavio.values();
-        naviosRestantes = new int[tipos.length];
-        for (int i = 0; i < tipos.length; i++) {
-            naviosRestantes[i] = tipos[i].getQuantidade();
+    public void iniciar() {
+        limparEcra();
+        bannerBoas();
+        try {
+            print(CYAN, "▶ A ligar a " + host + ":" + porta + "...\n");
+            ligacao = new LigacaoServidor(host, porta, this);
+            print(GREEN, "✔ Ligado! A aguardar início do jogo...\n");
+            aguardarFase(Fase.POSICIONAMENTO);
+            fasePosicionamento();
+            aguardarFase(Fase.JOGO_MEU_TURNO, Fase.JOGO_TURNO_ADV);
+            faseJogo();
+        } catch (Exception e) {
+            print(RED, "\n✖ Erro: " + e.getMessage() + "\n");
         }
     }
 
-    // ─── Callback do servidor ────────────────────────────────────────────────
+    // ── Fase de Posicionamento ────────────────────────────────────────────────
 
-    /**
-     * Chamado pela thread de leitura quando chega uma mensagem do servidor.
-     * Nota: este método corre na thread do LeitorServidor, não na thread principal!
-     * Por isso usamos synchronized / volatile para partilha de dados.
-     */
+    private void fasePosicionamento() {
+        limparEcra();
+        tituloPosicionamento();
+        mostrarNaviosPorPosicionar();
+        mostrarTabuleiroProprio();
+
+        for (TipoNavio tipo : TipoNavio.values()) {
+            int qtd = naviosPorPosicionar.get(tipo);
+            for (int i = 0; i < qtd; i++) {
+                boolean ok = false;
+                while (!ok) {
+                    ok = pedirPosicaoNavio(tipo, i + 1, qtd);
+                }
+            }
+        }
+
+        print(GREEN, "\n✔ Todos os navios posicionados! A aguardar o adversário...\n");
+        ligacao.enviar(new Mensagem(TipoMensagem.PRONTO));
+        setFase(Fase.AGUARDAR_ADV);
+        print(DIM, "  (aguarda que o adversário termine de posicionar os seus navios)\n");
+        aguardarFase(Fase.JOGO_MEU_TURNO, Fase.JOGO_TURNO_ADV);
+    }
+
+    private boolean pedirPosicaoNavio(TipoNavio tipo, int num, int total) {
+        System.out.println();
+        print(BOLD + YELLOW, "  ┌─ Posicionar: " + tipo.getNome()
+                + " (" + tipo.getTamanho() + " casas)"
+                + (total > 1 ? " [" + num + "/" + total + "]" : "") + "\n");
+        print(WHITE, "  │  Início (ex: A1, B3, C10): ");
+        String celula = lerLinha().trim().toUpperCase();
+        if (!Tabuleiro.celulaValida(celula)) {
+            print(RED, "  └✖ Célula inválida. Use letra A-J + número 1-10 (ex: A1, B10)\n"); return false;
+        }
+        print(WHITE, "  │  Orientação [H]orizontal / [V]ertical: ");
+        String ori = lerLinha().trim().toUpperCase();
+        if (!ori.equals("H") && !ori.equals("V")) {
+            print(RED, "  └✖ Orientação inválida. Use H ou V\n"); return false;
+        }
+
+        // Validação local antes de enviar
+        var celulas = UtilNavio.calcularCelulas(celula, ori.charAt(0), tipo.getTamanho());
+        if (celulas == null) {
+            print(RED, "  └✖ O navio ultrapassa os limites do tabuleiro!\n"); return false;
+        }
+        var navio = new batalhanaval.jogo.Navio(tipo, celulas);
+        if (!tabLocal.colocarNavio(navio)) {
+            print(RED, "  └✖ Posição ocupada ou inválida!\n"); return false;
+        }
+
+        // Envia ao servidor (servidor também valida)
+        ligacao.enviar(new Mensagem(TipoMensagem.POSICIONAR_NAVIO,
+                UtilNavio.serializarPosicionamento(tipo, celula, ori.charAt(0))));
+
+        // Aguarda confirmação do servidor (com timeout)
+        try {
+            synchronized (lock) { lock.wait(3000); }
+        } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        if (fase == Fase.ERRO) {
+            tabLocal.getNavios(); // o navio já não está no local → desfaz
+            // Re-cria o tabuleiro local sem o último navio (simplificação)
+            print(RED, "  └✖ Servidor recusou: " + ultimaMensagem + "\n");
+            return false;
+        }
+        print(GREEN, "  └✔ " + tipo.getNome() + " posicionado em " + celulas + "\n");
+        mostrarTabuleiroProprio();
+        return true;
+    }
+
+    // ── Fase de Jogo ──────────────────────────────────────────────────────────
+
+    private void faseJogo() {
+        while (fase != Fase.FIM && fase != Fase.ERRO) {
+            renderUI();
+            if (fase == Fase.JOGO_MEU_TURNO) {
+                executarTiro();
+            } else if (fase == Fase.JOGO_TURNO_ADV) {
+                print(DIM, "\n  ⏳ Aguarda o tiro do adversário...\n");
+                aguardarFase(Fase.JOGO_MEU_TURNO, Fase.FIM);
+            }
+        }
+        renderFimJogo();
+    }
+
+    private void executarTiro() {
+        print(BOLD + CYAN, "\n  ╔════════════════════════════════════╗\n");
+        print(BOLD + CYAN, "  ║  É O TEU TURNO!  Tiros: " + tirosRestantes + "           ║\n");
+        print(BOLD + CYAN, "  ╚════════════════════════════════════╝\n");
+        print(WHITE, "  Coordenada (ex: B4) ou [S]air: ");
+        String input = lerLinha().trim().toUpperCase();
+
+        if (input.equals("S") || input.equals("SAIR")) {
+            ligacao.enviar(new Mensagem(TipoMensagem.SAIR));
+            setFase(Fase.FIM);
+            return;
+        }
+        if (input.equalsIgnoreCase("GUARDAR")) {
+            ligacao.enviar(new Mensagem(TipoMensagem.GUARDAR));
+            return;
+        }
+        if (!Tabuleiro.celulaValida(input)) {
+            print(RED, "  ✖ Coordenada inválida! Use letra A-J + número 1-10\n"); return;
+        }
+        ligacao.enviar(new Mensagem(TipoMensagem.TIRO, input));
+        // Aguarda resultado (TEU_TURNO ou TURNO_ADVERSARIO ou FIM_JOGO)
+        aguardarFase(Fase.JOGO_MEU_TURNO, Fase.JOGO_TURNO_ADV, Fase.FIM);
+    }
+
+    // ── Callback do socket (corre na thread LeitorServidor) ───────────────────
+
     @Override
-    public synchronized void onMensagemRecebida(Mensagem msg) {
+    public void onMensagemRecebida(Mensagem msg) {
         switch (msg.getTipo()) {
 
             case LIGADO:
-                // Formato: "1:IDXXX" ou "2:IDXXX"
-                String[] partes = msg.getDados().split(":");
-                numeroJogador = Integer.parseInt(partes[0]);
-                idJogo = partes.length > 1 ? partes[1] : "";
-                System.out.println("\n✔ Ligado como Jogador " + numeroJogador + " | Jogo: " + idJogo);
+                String[] p = msg.getDados().split(":");
+                numJogador = Integer.parseInt(p[0]);
+                idJogo = p.length > 1 ? p[1] : "";
                 break;
 
             case INICIAR_POSICIONAMENTO:
-                faseActual = Fase.POSICIONAMENTO;
-                System.out.println("\n══ FASE DE POSICIONAMENTO ══");
-                System.out.println(msg.getDados());
-                mostrarNaviosRestantes();
-                notifyAll(); // Acorda a thread principal se estiver à espera
+                setFase(Fase.POSICIONAMENTO);
                 break;
 
             case NAVIO_POSICIONADO:
-                System.out.println("✔ " + msg.getDados());
-                mostrarNaviosRestantes();
-                notifyAll();
+                ultimaMensagem = msg.getDados();
+                notificarLock();
                 break;
 
             case NAVIO_INVALIDO:
-                System.out.println("✖ Posição inválida: " + msg.getDados());
-                notifyAll();
-                break;
-
-            case AGUARDAR:
-                faseActual = Fase.AGUARDAR;
-                System.out.println("⏳ " + msg.getDados());
-                notifyAll();
-                break;
-
-            case ESTADO_TABULEIRO:
-                // Guarda o estado e imprime (substitui \n de volta)
-                ultimoEstadoTabuleiros = msg.getDados().replace("\\n", "\n");
-                String[] tabs = ultimoEstadoTabuleiros.split("\\|\\|");
-                if (tabs.length >= 2) {
-                    System.out.println(tabs[0]);
-                    System.out.println(tabs[1]);
-                }
+                ultimaMensagem = msg.getDados();
+                setFase(Fase.ERRO);
+                notificarLock();
+                // Volta ao posicionamento após erro
+                setFase(Fase.POSICIONAMENTO);
                 break;
 
             case TEU_TURNO:
-                faseActual = Fase.JOGO;
-                meuTurno = true;
-                System.out.println("\n🎯 " + msg.getDados());
-                notifyAll();
+                tirosRestantes = batalhanaval.jogo.EstadoJogo.TIROS_POR_TURNO;
+                ultimaMensagem = msg.getDados();
+                setFase(Fase.JOGO_MEU_TURNO);
                 break;
 
             case TURNO_ADVERSARIO:
-                faseActual = Fase.JOGO;
-                meuTurno = false;
-                System.out.println("\n⏳ " + msg.getDados());
-                break;
-
-            case RESULTADO_TIRO:
-                System.out.println("📣 Resultado do teu tiro: " + formatarResultado(msg.getDados()));
-                break;
-
-            case TIRO_ADVERSARIO:
-                System.out.println("💥 Tiro do adversário: " + formatarResultado(msg.getDados()));
+                ultimaMensagem = msg.getDados();
+                setFase(Fase.JOGO_TURNO_ADV);
                 break;
 
             case TIROS_RESTANTES:
-                System.out.println("🔫 " + msg.getDados());
-                notifyAll();
+                try { tirosRestantes = Integer.parseInt(msg.getDados().trim()); } catch (NumberFormatException ignored) {}
+                setFase(Fase.JOGO_MEU_TURNO);
+                break;
+
+            case RESULTADO_TIRO:
+                mostrarResultadoTiro(msg.getDados(), true);
+                break;
+
+            case TIRO_ADVERSARIO:
+                mostrarResultadoTiro(msg.getDados(), false);
+                break;
+
+            case ESTADO_TABULEIRO:
+                tabuleirosTexto = msg.getDados();
                 break;
 
             case FIM_JOGO:
-                faseActual = Fase.FIM;
-                System.out.println("\n╔══════════════════════════════╗");
-                System.out.println("║  FIM DO JOGO: " + msg.getDados() + "          ║");
-                System.out.println("╚══════════════════════════════╝");
-                notifyAll();
+                ultimaMensagem = msg.getDados();
+                setFase(Fase.FIM);
                 break;
 
             case JOGO_GUARDADO:
-                System.out.println("💾 Jogo guardado: " + msg.getDados());
+                print(GREEN, "\n  ✔ Jogo guardado em: " + msg.getDados() + "\n");
                 break;
 
             case JOGO_CARREGADO:
-                System.out.println("📂 Jogo carregado: " + msg.getDados());
-                faseActual = Fase.JOGO;
-                notifyAll();
+                print(GREEN, "\n  ✔ Jogo carregado: " + msg.getDados() + "\n");
                 break;
 
             case ADVERSARIO_DESLIGADO:
-                System.out.println("⚠ " + msg.getDados());
-                faseActual = Fase.FIM;
-                notifyAll();
+                print(RED, "\n  ✖ " + msg.getDados() + "\n");
+                setFase(Fase.FIM);
                 break;
 
             case ERRO:
-                System.out.println("⚠ Erro: " + msg.getDados());
-                notifyAll();
+                print(RED, "\n  ✖ Servidor: " + msg.getDados() + "\n");
+                notificarLock();
                 break;
 
             default:
-                System.out.println("[MSG] " + msg.serializar());
+                break;
         }
     }
 
-    @Override
-    public void onDesconexao() {
-        System.out.println("\n[CLIENTE] Ligação ao servidor perdida.");
-        faseActual = Fase.FIM;
+    // ── Renderização ──────────────────────────────────────────────────────────
+
+    private void renderUI() {
+        limparEcra();
+        // Cabeçalho
+        System.out.println(BOLD + CYAN
+            + "  ╔══════════════════════════════════════════════════════════╗");
+        System.out.printf( "  ║  ⚓  BATALHA NAVAL  │  Jogador %d  │  Jogo: %-14s║%n",
+                numJogador, idJogo);
+        System.out.println(
+            "  ╚══════════════════════════════════════════════════════════╝" + RESET);
+
+        // Tabuleiros lado a lado (renderizados localmente com ANSI)
+        System.out.println(tabLocal.renderDuplo());
+
+        // Última mensagem do servidor
+        if (!ultimaMensagem.isEmpty()) {
+            print(YELLOW, "  → " + ultimaMensagem + "\n");
+        }
+        System.out.println();
     }
 
-    // ─── Loop principal do cliente ───────────────────────────────────────────
+    private void mostrarResultadoTiro(String dados, boolean meuTiro) {
+        // dados = "AGUA:B4" ou "ACERTOU:Fragata:B4" ou "AFUNDOU:Fragata:B4"
+        String[] p = dados.split(":");
+        String tipo = p[0];
+        String coord = p[p.length - 1];
+        String nomeNavio = (p.length > 2) ? p[1] : "";
 
-    /**
-     * Loop principal de interacção com o utilizador.
-     * Corre na thread principal.
-     */
-    public void iniciar() {
-        System.out.println("╔══════════════════════════════════════╗");
-        System.out.println("║      BATALHA NAVAL - CLIENTE         ║");
-        System.out.println("╚══════════════════════════════════════╝");
-
-        // Aguarda confirmação de ligação
-        aguardarFase(Fase.POSICIONAMENTO, 30000);
-
-        // Fase de posicionamento
-        if (faseActual == Fase.POSICIONAMENTO) {
-            fasePosicionamento();
-        }
-
-        // Loop do jogo
-        while (faseActual != Fase.FIM) {
-            if (faseActual == Fase.JOGO && meuTurno) {
-                faseTiro();
-            } else {
-                // Aguarda o turno ou mensagem do servidor (até 2 minutos)
-                pausar(500);
+        if (meuTiro) {
+            switch (tipo) {
+                case "AGUA":
+                    print(BLUE,   "  💧 ÁGUA em " + coord + "!\n");
+                    break;
+                case "ACERTOU":
+                    print(RED,    "  🎯 ACERTOU! " + nomeNavio + " em " + coord + "!\n");
+                    break;
+                case "AFUNDOU":
+                    print(BOLD + RED + BG_CYAN,
+                          "  💥 AFUNDOU o " + nomeNavio + " em " + coord + "!\n");
+                    break;
+            }
+            // Actualiza tabuleiro adversário local
+            tabLocal.registarTiroEfetuado(coord, tipo);
+        } else {
+            switch (tipo) {
+                case "AGUA":
+                    print(DIM,    "  💧 Adversário atirou " + coord + " → ÁGUA\n");
+                    break;
+                case "ACERTOU":
+                    print(YELLOW, "  ⚠  Adversário acertou no teu " + nomeNavio + " em " + coord + "!\n");
+                    break;
+                case "AFUNDOU":
+                    print(BOLD + RED, "  ☠  Adversário afundou o teu " + nomeNavio + " em " + coord + "!\n");
+                    break;
             }
         }
-
-        System.out.println("\nObrigado por jogar! A fechar...");
-        ligacao.desligar();
+        ultimaMensagem = (meuTiro ? "O teu tiro: " : "Tiro adversário: ")
+                       + tipo + (nomeNavio.isEmpty() ? "" : " " + nomeNavio) + " em " + coord;
     }
 
-    // ─── Fase de Posicionamento ──────────────────────────────────────────────
+    private void renderFimJogo() {
+        limparEcra();
+        boolean vitoria = "VITORIA".equals(ultimaMensagem);
+        boolean empate  = "EMPATE".equals(ultimaMensagem);
+
+        if (vitoria) {
+            System.out.println(BOLD + GREEN);
+            System.out.println("  ╔══════════════════════════════════════════╗");
+            System.out.println("  ║          🏆  VITÓRIA!  PARABÉNS!  🏆      ║");
+            System.out.println("  ╚══════════════════════════════════════════╝");
+        } else if (empate) {
+            System.out.println(BOLD + YELLOW);
+            System.out.println("  ╔══════════════════════════════════════════╗");
+            System.out.println("  ║              🤝  EMPATE!                 ║");
+            System.out.println("  ╚══════════════════════════════════════════╝");
+        } else {
+            System.out.println(BOLD + RED);
+            System.out.println("  ╔══════════════════════════════════════════╗");
+            System.out.println("  ║              💀  DERROTA...              ║");
+            System.out.println("  ╚══════════════════════════════════════════╝");
+        }
+        System.out.println(RESET);
+        System.out.println(tabLocal.renderDuplo());
+        System.out.println(DIM + "  Obrigado por jogar! Prima ENTER para sair." + RESET);
+        lerLinha();
+        ligacao.fechar();
+    }
+
+    // ── Helpers de UI ─────────────────────────────────────────────────────────
+
+    private void bannerBoas() {
+        System.out.println(BOLD + BLUE);
+        System.out.println("  ╔══════════════════════════════════════════════╗");
+        System.out.println("  ║     ⚓  BATALHA NAVAL  ⚓                     ║");
+        System.out.println("  ║     Laboratórios de Programação — TP3        ║");
+        System.out.println("  ╚══════════════════════════════════════════════╝");
+        System.out.println(RESET);
+    }
+
+    private void tituloPosicionamento() {
+        System.out.println(BOLD + MAGENTA
+            + "  ╔══════════════════════════════════════════════╗\n"
+            + "  ║   🚢  FASE DE POSICIONAMENTO DOS NAVIOS  🚢   ║\n"
+            + "  ╚══════════════════════════════════════════════╝"
+            + RESET + "\n");
+    }
+
+    private void mostrarNaviosPorPosicionar() {
+        System.out.println(BOLD + WHITE + "  Navios a posicionar:" + RESET);
+        for (TipoNavio t : TipoNavio.values()) {
+            System.out.printf("    %s%-15s%s × %d  (%d casas)%n",
+                GREEN, t.getNome(), RESET, t.getQuantidade(), t.getTamanho());
+        }
+        System.out.println();
+    }
+
+    private void mostrarTabuleiroProprio() {
+        System.out.println(tabLocal.renderProprioTabuleiro());
+    }
+
+    private static void limparEcra() {
+        // Funciona na maioria dos terminais (NetBeans Output tab respeita sequências ANSI)
+        System.out.print("\u001B[H\u001B[2J");
+        System.out.flush();
+    }
+
+    static void print(String cor, String msg) {
+        System.out.print(cor + msg + RESET);
+    }
+
+    private String lerLinha() {
+        try { return scanner.nextLine(); }
+        catch (Exception e) { return ""; }
+    }
+
+    // ── Sincronização por wait/notify ────────────────────────────────────────
 
     /**
-     * Gere a fase de posicionamento dos navios.
-     * Pede ao utilizador para colocar cada tipo de navio.
+     * Bloqueia a thread principal até a fase ser uma das esperadas.
+     * A thread do socket chama setFase() → notifyAll() para acordar.
      */
-    private void fasePosicionamento() {
-        TipoNavio[] tipos = TipoNavio.values();
-
-        for (int i = 0; i < tipos.length; i++) {
-            TipoNavio tipo = tipos[i];
-            int quantidade = tipo.getQuantidade();
-
-            for (int j = 0; j < quantidade; j++) {
-                boolean colocado = false;
-                while (!colocado) {
-                    System.out.println("\n─── Posicionar " + tipo.getNome() +
-                            " (tamanho " + tipo.getTamanho() + ") [" + (j+1) + "/" + quantidade + "] ───");
-                    System.out.print("Célula inicial (ex: A1): ");
-                    String celula = scanner.nextLine().trim().toUpperCase();
-
-                    System.out.print("Orientação H(horizontal) ou V(vertical): ");
-                    String orientStr = scanner.nextLine().trim().toUpperCase();
-
-                    if (orientStr.isEmpty() || (!orientStr.startsWith("H") && !orientStr.startsWith("V"))) {
-                        System.out.println("Orientação inválida. Use H ou V.");
-                        continue;
-                    }
-
-                    char orientacao = orientStr.charAt(0);
-
-                    // Pré-valida localmente para dar feedback imediato
-                    if (UtilNavio.calcularCelulas(celula, orientacao, tipo.getTamanho()) == null) {
-                        System.out.println("Posição fora do tabuleiro. Tente novamente.");
-                        continue;
-                    }
-
-                    // Envia ao servidor para validação definitiva
-                    String dados = UtilNavio.serializarPosicionamento(tipo, celula, orientacao);
-                    ligacao.enviarMensagem(TipoMensagem.POSICIONAR_NAVIO, dados);
-
-                    // Aguarda resposta do servidor (NAVIO_POSICIONADO ou NAVIO_INVALIDO)
-                    // (simplificado: pequena pausa)
-                    pausar(500);
-                    colocado = true; // Se NAVIO_INVALIDO, o callback já avisou e repetiremos
-                }
+    private void aguardarFase(Fase... fasesEsperadas) {
+        synchronized (lock) {
+            while (!faseIgualA(fasesEsperadas)) {
+                try { lock.wait(200); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
         }
-
-        // Confirma que terminou o posicionamento
-        System.out.println("\n✔ Todos os navios colocados! A confirmar...");
-        ligacao.enviarMensagem(TipoMensagem.PRONTO);
-        faseActual = Fase.AGUARDAR;
-
-        // Aguarda o adversário
-        System.out.println("⏳ À espera que o adversário posicione os navios...");
-        aguardarFase(Fase.JOGO, 120000);
     }
 
-    // ─── Fase de Tiro ────────────────────────────────────────────────────────
-
-    /**
-     * Gere os tiros do jogador quando é o seu turno.
-     */
-    private void faseTiro() {
-        System.out.println("\n─── O TEU TURNO ───");
-        System.out.println("Comandos: <célula> para atirar (ex: B3) | GUARDAR | SAIR");
-        System.out.print("> ");
-
-        String input = scanner.nextLine().trim().toUpperCase();
-
-        if (input.equals("GUARDAR")) {
-            ligacao.enviarMensagem(TipoMensagem.GUARDAR);
-            return;
-        }
-
-        if (input.equals("SAIR")) {
-            ligacao.enviarMensagem(TipoMensagem.SAIR);
-            faseActual = Fase.FIM;
-            return;
-        }
-
-        // Valida coordenada localmente
-        if (!batalhanaval.jogo.Tabuleiro.celulaValida(input)) {
-            System.out.println("Coordenada inválida. Use formato A1–J10.");
-            return;
-        }
-
-        // Envia tiro ao servidor
-        ligacao.enviarMensagem(TipoMensagem.TIRO, input);
-        meuTurno = false; // Aguarda resposta (será re-activado por TEU_TURNO se ainda tiver tiros)
+    private boolean faseIgualA(Fase[] fases) {
+        for (Fase f : fases) { if (fase == f) return true; }
+        return false;
     }
 
-    // ─── Utilitários ────────────────────────────────────────────────────────
-
-    /** Formata o resultado de um tiro para apresentação */
-    private String formatarResultado(String dados) {
-        if (dados.startsWith("AGUA")) return "💧 Água em " + dados.split(":")[1];
-        if (dados.startsWith("ACERTOU")) return "🔥 Acertou em " + dados.split(":")[1] + " (" + dados.split(":")[2] + ")";
-        if (dados.startsWith("AFUNDOU")) return "💣 Afundou " + dados.split(":")[1] + " (" + dados.split(":")[2] + ")";
-        return dados;
+    private void setFase(Fase novaFase) {
+        synchronized (lock) { fase = novaFase; lock.notifyAll(); }
     }
 
-    /** Mostra quantos navios de cada tipo ainda faltam colocar */
-    private void mostrarNaviosRestantes() {
-        System.out.println("\nNavios para colocar:");
-        for (TipoNavio tipo : TipoNavio.values()) {
-            System.out.println("  " + tipo.getNome() + " (tam " + tipo.getTamanho() + "): " + tipo.getQuantidade() + "x");
-        }
-    }
-
-    /** Aguarda até a fase ser a esperada, com timeout */
-    private synchronized void aguardarFase(Fase fase, long timeoutMs) {
-        long inicio = System.currentTimeMillis();
-        while (faseActual != fase && faseActual != Fase.FIM) {
-            long restante = timeoutMs - (System.currentTimeMillis() - inicio);
-            if (restante <= 0) break;
-            try { wait(restante); } catch (InterruptedException e) { break; }
-        }
-    }
-
-    /** Pausa a thread corrente por ms milissegundos */
-    private void pausar(long ms) {
-        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+    private void notificarLock() {
+        synchronized (lock) { lock.notifyAll(); }
     }
 }
