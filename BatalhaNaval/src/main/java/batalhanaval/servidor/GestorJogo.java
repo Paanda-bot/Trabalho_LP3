@@ -1,323 +1,153 @@
 package batalhanaval.servidor;
 
-import batalhanaval.jogo.EstadoJogo;
-import batalhanaval.jogo.Navio;
-import batalhanaval.protocolo.Mensagem;
-import batalhanaval.protocolo.TipoMensagem;
+import batalhanaval.jogo.*;
+import batalhanaval.protocolo.*;
 import batalhanaval.util.UtilNavio;
 
 import java.io.*;
 import java.net.Socket;
-import java.util.UUID;
+import java.util.*;
 
-/**
- * ══════════════════════════════════════════════════════════
- *  GestorJogo — árbitro de uma partida entre dois jogadores
- * ══════════════════════════════════════════════════════════
- *
- * UML:
- *   GestorJogo implements Runnable
- *   ─────────────────────────────────────────────────────────
- *   - idJogo: String
- *   - socketJ1, socketJ2: Socket
- *   - outJ1, outJ2: PrintWriter
- *   - estado: EstadoJogo
- *   - j1Ligado, j2Ligado: volatile boolean
- *   ─────────────────────────────────────────────────────────
- *   + run(): void                 ← Thread principal do jogo
- *   - processarMensagem(int, Mensagem): void   ← synchronized
- *   - processarPosicionamento(int, String): void
- *   - processarTiro(int, String): void
- *   - guardarJogo(int): void
- *   - carregarJogo(int, String): void
- *   - enviarMensagem(int, TipoMensagem, String): void
- *   - enviarTabuleiros(int): void
- *
- *   [inner class] LeitorCliente implements Runnable
- *   ─────────────────────────────────────────────────────────
- *   Lê mensagens de um cliente numa Thread dedicada
- *   e chama processarMensagem() para cada uma.
- *
- * Por que synchronized em processarMensagem?
- *   → Dois LeitorCliente podem chamar este método em simultâneo
- *     (um por cada jogador). O synchronized garante que só um
- *     processa de cada vez, evitando race conditions no EstadoJogo.
- */
+/** Árbitro de um jogo: valida tiros, gere turnos, guarda estado */
 public class GestorJogo implements Runnable {
-
-    private static final String PASTA_SAVES = "saves/";
-
     private final String idJogo;
-    private final Socket socketJ1;
-    private final Socket socketJ2;
-    private PrintWriter  outJ1;
-    private PrintWriter  outJ2;
-    private EstadoJogo   estado;
-    private volatile boolean j1Ligado = true;
-    private volatile boolean j2Ligado = true;
+    private final Socket[] sockets        = new Socket[3];
+    private final PrintWriter[] saida     = new PrintWriter[3];
+    private final BufferedReader[] entrada = new BufferedReader[3];
+    private EstadoJogo estado;
+    private int jogadoresProntos = 0;
 
-    public GestorJogo(Socket socketJ1, Socket socketJ2) {
-        this.socketJ1 = socketJ1;
-        this.socketJ2 = socketJ2;
-        this.idJogo   = UUID.randomUUID().toString().substring(0, 8).toUpperCase();
-        new File(PASTA_SAVES).mkdirs();
+    public GestorJogo(Socket s1, Socket s2, String id) throws IOException {
+        this.idJogo = id;
+        sockets[1] = s1; sockets[2] = s2;
+        for (int j=1;j<=2;j++) {
+            saida[j]   = new PrintWriter(new OutputStreamWriter(sockets[j].getOutputStream(),"UTF-8"),true);
+            entrada[j] = new BufferedReader(new InputStreamReader(sockets[j].getInputStream(),"UTF-8"));
+        }
     }
 
-    public String getIdJogo() { return idJogo; }
-
-    @Override
-    public void run() {
-        log(ServidorMain.GREEN, "Jogo " + idJogo + " a iniciar...");
+    @Override public void run() {
         try {
-            outJ1 = new PrintWriter(new BufferedWriter(
-                    new OutputStreamWriter(socketJ1.getOutputStream())), true);
-            outJ2 = new PrintWriter(new BufferedWriter(
-                    new OutputStreamWriter(socketJ2.getOutputStream())), true);
+            // Carrega save se existir
+            if (EstadoJogo.existeSave(EstadoJogo.FICHEIRO_PADRAO)) {
+                try { estado = EstadoJogo.carregar(EstadoJogo.FICHEIRO_PADRAO);
+                      enviar(1,TipoMensagem.JOGO_RECUPERADO,"Jogo recuperado!");
+                      enviar(2,TipoMensagem.JOGO_RECUPERADO,"Jogo recuperado!"); }
+                catch (Exception e) { estado = new EstadoJogo(idJogo); }
+            } else { estado = new EstadoJogo(idJogo); }
 
-            estado = new EstadoJogo(idJogo);
+            enviar(1,TipoMensagem.LIGADO,"1",idJogo);
+            enviar(2,TipoMensagem.LIGADO,"2",idJogo);
 
-            enviarMensagem(1, TipoMensagem.LIGADO, "1:" + idJogo);
-            enviarMensagem(2, TipoMensagem.LIGADO, "2:" + idJogo);
-            enviarMensagem(1, TipoMensagem.INICIAR_POSICIONAMENTO, "Posicione os seus navios.");
-            enviarMensagem(2, TipoMensagem.INICIAR_POSICIONAMENTO, "Posicione os seus navios.");
+            if (estado.getFase() == EstadoJogo.Fase.POSICIONAMENTO) {
+                enviar(1,TipoMensagem.INICIAR_POSICIONAMENTO,"Posicione os navios");
+                enviar(2,TipoMensagem.INICIAR_POSICIONAMENTO,"Posicione os navios");
+                Thread t1 = new Thread(()->tratarPosicionamento(1),"Pos-J1");
+                Thread t2 = new Thread(()->tratarPosicionamento(2),"Pos-J2");
+                t1.start(); t2.start(); t1.join(); t2.join();
+            }
 
-            Thread lj1 = new Thread(new LeitorCliente(1, socketJ1), "Leitor-J1-" + idJogo);
-            Thread lj2 = new Thread(new LeitorCliente(2, socketJ2), "Leitor-J2-" + idJogo);
-            lj1.setDaemon(true);
-            lj2.setDaemon(true);
-            lj1.start();
-            lj2.start();
-            lj1.join();
-            lj2.join();
-
-        } catch (IOException | InterruptedException e) {
-            log(ServidorMain.RED, "Erro no jogo " + idJogo + ": " + e.getMessage());
-            guardarAutomaticamente();
-        } finally {
-            fecharLigacoes();
-            ServidorMain.jogosActivos.remove(idJogo);
-            log(ServidorMain.DIM, "Jogo " + idJogo + " terminado.");
-        }
-    }
-
-    // ── Processamento de mensagens ───────────────────────────────────────────
-
-    private synchronized void processarMensagem(int jogador, Mensagem msg) {
-        if (msg == null) return;
-        log(ServidorMain.DIM, "J" + jogador + " → " + msg.serializar());
-
-        switch (msg.getTipo()) {
-            case POSICIONAR_NAVIO: processarPosicionamento(jogador, msg.getDados()); break;
-            case PRONTO:           processarPronto(jogador);                          break;
-            case TIRO:             processarTiro(jogador, msg.getDados());            break;
-            case GUARDAR:          guardarJogo(jogador);                              break;
-            case CARREGAR:         carregarJogo(jogador, msg.getDados());             break;
-            case SAIR:             tratarDesconexao(jogador);                         break;
-            default: enviarMensagem(jogador, TipoMensagem.ERRO, "Comando desconhecido.");
-        }
-    }
-
-    // ── Posicionamento ───────────────────────────────────────────────────────
-
-    private void processarPosicionamento(int jogador, String dados) {
-        if (estado.getFase() != EstadoJogo.Fase.POSICIONAMENTO) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Não é fase de posicionamento."); return;
-        }
-        Navio navio = UtilNavio.deserializarPosicionamento(dados);
-        if (navio == null) {
-            enviarMensagem(jogador, TipoMensagem.NAVIO_INVALIDO, "Formato inválido: " + dados); return;
-        }
-        if (estado.colocarNavio(jogador, navio)) {
-            enviarMensagem(jogador, TipoMensagem.NAVIO_POSICIONADO,
-                    navio.getTipo().getNome() + " em " + navio.getCelulas());
-        } else {
-            enviarMensagem(jogador, TipoMensagem.NAVIO_INVALIDO,
-                    "Posição inválida para " + navio.getTipo().getNome());
-        }
-    }
-
-    private void processarPronto(int jogador) {
-        if (estado.getFase() != EstadoJogo.Fase.POSICIONAMENTO) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Não é fase de posicionamento."); return;
-        }
-        if (!estado.getTabuleiro(jogador).estaCompleto()) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Ainda faltam navios por posicionar."); return;
-        }
-        estado.marcarPronto(jogador);
-        enviarMensagem(jogador, TipoMensagem.AGUARDAR, "A aguardar o adversário...");
-        if (estado.getFase() == EstadoJogo.Fase.JOGO) iniciarFaseJogo();
-    }
-
-    private void iniciarFaseJogo() {
-        int actual = estado.getJogadorActual();
-        int outro  = (actual == 1) ? 2 : 1;
-        log(ServidorMain.GREEN, "Jogo " + idJogo + " INICIADO! Começa J" + actual);
-        enviarMensagem(actual, TipoMensagem.TEU_TURNO,
-                "O jogo começa! Tens " + EstadoJogo.TIROS_POR_TURNO + " tiros.");
-        enviarMensagem(outro,  TipoMensagem.TURNO_ADVERSARIO,
-                "O jogo começa! Aguarda a tua vez (J" + actual + " começa).");
-        enviarTabuleiros(1);
-        enviarTabuleiros(2);
-    }
-
-    // ── Tiros ────────────────────────────────────────────────────────────────
-
-    private void processarTiro(int jogador, String coordenada) {
-        if (estado.getFase() != EstadoJogo.Fase.JOGO) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "O jogo ainda não começou."); return;
-        }
-        String resultado = estado.processarTiro(jogador, coordenada);
-        if ("NAO_TEU_TURNO".equals(resultado)) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Não é o teu turno."); return;
-        }
-        if ("JA_ATIRADO".equals(resultado)) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Já atiraste para " + coordenada + "."); return;
-        }
-
-        String resMsg = resultado + ":" + coordenada;
-        int adversario = (jogador == 1) ? 2 : 1;
-
-        enviarMensagem(jogador,    TipoMensagem.RESULTADO_TIRO,  resMsg);
-        enviarMensagem(adversario, TipoMensagem.TIRO_ADVERSARIO, resMsg);
-        enviarTabuleiros(1);
-        enviarTabuleiros(2);
-
-        if (estado.jogoTerminou()) {
-            anunciarFimJogo();
-        } else if (estado.getJogadorActual() == jogador) {
-            // Ainda é o mesmo turno
-            enviarMensagem(jogador, TipoMensagem.TIROS_RESTANTES,
-                    "" + estado.getTirosRestantesNoTurno());
-        } else {
-            // Turno passou
-            int novoActual = estado.getJogadorActual();
-            int novoOutro  = (novoActual == 1) ? 2 : 1;
-            enviarMensagem(novoActual, TipoMensagem.TEU_TURNO,
-                    "É o teu turno! Tens " + EstadoJogo.TIROS_POR_TURNO + " tiros.");
-            enviarMensagem(novoOutro,  TipoMensagem.TURNO_ADVERSARIO,
-                    "Aguarda. É o turno do Jogador " + novoActual + ".");
-        }
-    }
-
-    private void anunciarFimJogo() {
-        int vencedor = estado.getResultado();
-        log(ServidorMain.YELLOW, "Jogo " + idJogo + " TERMINADO! Vencedor: J" + vencedor);
-        if (vencedor == 1) {
-            enviarMensagem(1, TipoMensagem.FIM_JOGO, "VITORIA");
-            enviarMensagem(2, TipoMensagem.FIM_JOGO, "DERROTA");
-        } else if (vencedor == 2) {
-            enviarMensagem(1, TipoMensagem.FIM_JOGO, "DERROTA");
-            enviarMensagem(2, TipoMensagem.FIM_JOGO, "VITORIA");
-        } else {
-            enviarMensagem(1, TipoMensagem.FIM_JOGO, "EMPATE");
-            enviarMensagem(2, TipoMensagem.FIM_JOGO, "EMPATE");
-        }
-    }
-
-    // ── Save / Load ──────────────────────────────────────────────────────────
-
-    private void guardarJogo(int jogador) {
-        String caminho = PASTA_SAVES + "jogo_" + idJogo + ".dat";
-        try {
-            estado.guardarEmFicheiro(caminho);
-            enviarMensagem(1, TipoMensagem.JOGO_GUARDADO, caminho);
-            enviarMensagem(2, TipoMensagem.JOGO_GUARDADO, caminho);
-            log(ServidorMain.GREEN, "Jogo " + idJogo + " guardado → " + caminho);
-        } catch (IOException e) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Erro ao guardar: " + e.getMessage());
-        }
-    }
-
-    private void guardarAutomaticamente() {
-        if (estado == null) return;
-        String caminho = PASTA_SAVES + "jogo_" + idJogo + "_auto.dat";
-        try {
-            estado.guardarEmFicheiro(caminho);
-            log(ServidorMain.YELLOW, "Auto-save → " + caminho);
-        } catch (IOException e) {
-            log(ServidorMain.RED, "Erro auto-save: " + e.getMessage());
-        }
-    }
-
-    private void carregarJogo(int jogador, String caminho) {
-        try {
-            estado = EstadoJogo.carregarDeFicheiro(caminho);
-            enviarMensagem(1, TipoMensagem.JOGO_CARREGADO, "Jogo carregado de: " + caminho);
-            enviarMensagem(2, TipoMensagem.JOGO_CARREGADO, "Jogo carregado de: " + caminho);
-            enviarTabuleiros(1);
-            enviarTabuleiros(2);
-            iniciarFaseJogo();
-        } catch (IOException | ClassNotFoundException e) {
-            enviarMensagem(jogador, TipoMensagem.ERRO, "Erro ao carregar: " + e.getMessage());
-        }
-    }
-
-    // ── Comunicação ──────────────────────────────────────────────────────────
-
-    private void enviarTabuleiros(int jogador) {
-        String proprio    = estado.getTabuleiro(jogador).toStringProprioTabuleiro();
-        String adversario = estado.getTabuleiro(jogador).toStringTabuleirAdversario();
-        enviarMensagem(jogador, TipoMensagem.ESTADO_TABULEIRO,
-                proprio.replace("\n","\\n") + "||" + adversario.replace("\n","\\n"));
-    }
-
-    private void enviarMensagem(int jogador, TipoMensagem tipo, String dados) {
-        PrintWriter out = (jogador == 1) ? outJ1 : outJ2;
-        if (out != null) {
-            out.println(new Mensagem(tipo, dados).serializar());
-        }
-    }
-
-    private void tratarDesconexao(int jogador) {
-        log(ServidorMain.RED, "J" + jogador + " desligou-se do jogo " + idJogo);
-        guardarAutomaticamente();
-        int adversario = (jogador == 1) ? 2 : 1;
-        enviarMensagem(adversario, TipoMensagem.ADVERSARIO_DESLIGADO,
-                "O adversário desligou-se. Estado guardado automaticamente.");
-    }
-
-    private void fecharLigacoes() {
-        try { if (socketJ1 != null) socketJ1.close(); } catch (IOException ignored) {}
-        try { if (socketJ2 != null) socketJ2.close(); } catch (IOException ignored) {}
-    }
-
-    private void log(String cor, String msg) {
-        ServidorMain.log(cor, "[" + idJogo + "] " + msg);
-    }
-
-    // ── Thread de leitura do cliente ─────────────────────────────────────────
-
-    /**
-     * LeitorCliente — corre numa Thread dedicada por cliente.
-     *
-     * Por que precisamos de uma thread por cliente?
-     * → ServerSocket.accept() é bloqueante, assim como BufferedReader.readLine().
-     *   Se lermos ambos os clientes sequencialmente, um ficaria bloqueado enquanto
-     *   o outro esperava. Com uma thread por cliente, ambos lêem em paralelo.
-     * → O processamento das mensagens é synchronized para garantir
-     *   exclusão mútua no estado do jogo.
-     */
-    private class LeitorCliente implements Runnable {
-        private final int    jogador;
-        private final Socket socket;
-
-        LeitorCliente(int jogador, Socket socket) {
-            this.jogador = jogador;
-            this.socket  = socket;
-        }
-
-        @Override
-        public void run() {
-            try (BufferedReader in = new BufferedReader(
-                     new InputStreamReader(socket.getInputStream()))) {
-                String linha;
-                while ((linha = in.readLine()) != null) {
-                    processarMensagem(jogador, Mensagem.deserializar(linha));
-                    if (estado != null && estado.jogoTerminou()) break;
+            if (estado.getFase() != EstadoJogo.Fase.TERMINADO) {
+                estado.setFase(EstadoJogo.Fase.EM_JOGO);
+                if (estado.getJogadorActual()==0) {
+                    int ini = new Random().nextInt(2)+1;
+                    estado.setJogadorActual(ini);
+                    enviar(1,TipoMensagem.INFO,"Jogador "+ini+" comeca!");
+                    enviar(2,TipoMensagem.INFO,"Jogador "+ini+" comeca!");
                 }
-            } catch (IOException e) {
-                if (estado != null && !estado.jogoTerminou()) tratarDesconexao(jogador);
+                cicloJogo();
+            }
+        } catch (Exception e) {
+            System.err.println("["+idJogo+"] Erro: "+e.getMessage());
+            guardarJogo();
+        } finally { fechar(); }
+    }
+
+    private void tratarPosicionamento(int jogador) {
+        while (!estado.getTabuleiro(jogador).posicionamentoConcluido()) {
+            try {
+                String linha = entrada[jogador].readLine();
+                if (linha==null) { guardarJogo(); return; }
+                Mensagem m = Mensagem.parse(linha);
+                if (m==null) continue;
+                if (m.getTipo()==TipoMensagem.POSICIONAR_NAVIO) posicionar(jogador,m);
+                else if (m.getTipo()==TipoMensagem.GUARDAR) {
+                    guardarJogo(); enviar(jogador,TipoMensagem.JOGO_GUARDADO,"Guardado!");
+                }
+            } catch (IOException e) { guardarJogo(); return; }
+        }
+        enviar(jogador,TipoMensagem.INFO,"Posicionamento concluido! A aguardar adversario...");
+        synchronized(this) {
+            jogadoresProntos++;
+            notifyAll();
+            while (jogadoresProntos<2) {
+                try { wait(); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
             }
         }
+    }
+
+    private void posicionar(int jogador, Mensagem m) {
+        try {
+            TipoNavio tipo = TipoNavio.valueOf(m.getDado(0).toUpperCase());
+            char l = m.getDado(1).toUpperCase().charAt(0);
+            int  c = Integer.parseInt(m.getDado(2));
+            char o = m.getDado(3).toUpperCase().charAt(0);
+            Set<String> cells = UtilNavio.calcularCelulas(l,c,tipo.getTamanho(),o);
+            if (cells.isEmpty()) { enviar(jogador,TipoMensagem.ERRO_POSICIONAMENTO,"Fora dos limites"); return; }
+            boolean ok = estado.getTabuleiro(jogador).posicionarNavio(new Navio(tipo,cells));
+            if (ok) enviar(jogador,TipoMensagem.NAVIO_POSICIONADO,tipo.getNome()+" colocado em "+cells);
+            else    enviar(jogador,TipoMensagem.ERRO_POSICIONAMENTO,"Sobreposicao ou limite invalido");
+        } catch (Exception e) { enviar(jogador,TipoMensagem.ERRO_POSICIONAMENTO,"Formato invalido"); }
+    }
+
+    private void cicloJogo() throws IOException {
+        while (estado.getFase()==EstadoJogo.Fase.EM_JOGO) {
+            int atual = estado.getJogadorActual();
+            int adv   = estado.adversario(atual);
+            estado.setTirosRestantes(EstadoJogo.TIROS_POR_TURNO);
+            enviar(atual, TipoMensagem.TEU_TURNO, String.valueOf(EstadoJogo.TIROS_POR_TURNO));
+            enviar(adv,   TipoMensagem.TURNO_ADVERSARIO, "Turno do Jogador "+atual);
+
+            while (estado.getTirosRestantes()>0 && estado.getFase()==EstadoJogo.Fase.EM_JOGO) {
+                String linha = entrada[atual].readLine();
+                if (linha==null) { guardarJogo(); return; }
+                Mensagem m = Mensagem.parse(linha);
+                if (m==null) continue;
+                if (m.getTipo()==TipoMensagem.TIRO)    processarTiro(atual,adv,m);
+                else if (m.getTipo()==TipoMensagem.GUARDAR) {
+                    guardarJogo(); enviar(atual,TipoMensagem.JOGO_GUARDADO,"Guardado!");
+                }
+            }
+            if (estado.getFase()==EstadoJogo.Fase.EM_JOGO) estado.setJogadorActual(adv);
+        }
+    }
+
+    private void processarTiro(int atual, int adv, Mensagem m) {
+        // Mensagem: TIRO:Linha:Coluna  ex: TIRO:B:4  → chave "B4"
+        String chave = m.getDado(0).toUpperCase() + m.getDado(1);
+        if (estado.getTabuleiro(adv).jaDisparado(chave)) {
+            enviar(atual,TipoMensagem.TIRO_INVALIDO,"Celula "+chave+" ja disparada"); return;
+        }
+        String res = estado.getTabuleiro(adv).receberTiro(chave);
+        if (res==null) { enviar(atual,TipoMensagem.TIRO_INVALIDO,"Coordenada invalida"); return; }
+        estado.decrementarTiros();
+        enviar(atual, TipoMensagem.RESULTADO_TIRO, res, chave);
+        enviar(adv,   TipoMensagem.RESULTADO_TIRO, res, chave);
+        System.out.println("["+idJogo+"] J"+atual+" disparou "+chave+" -> "+res);
+        if (estado.getTabuleiro(adv).todosNaviosAfundados()) {
+            estado.setFase(EstadoJogo.Fase.TERMINADO);
+            enviar(atual, TipoMensagem.FIM_JOGO,"VITORIA");
+            enviar(adv,   TipoMensagem.FIM_JOGO,"DERROTA");
+            new File(EstadoJogo.FICHEIRO_PADRAO).delete();
+        }
+    }
+
+    private void guardarJogo() {
+        try { if (estado!=null) estado.guardar(EstadoJogo.FICHEIRO_PADRAO); }
+        catch (IOException e) { System.err.println("Erro ao guardar: "+e.getMessage()); }
+    }
+    private void enviar(int j, TipoMensagem t, String... d) { saida[j].println(new Mensagem(t,d)); }
+    private void fechar() {
+        for (int j=1;j<=2;j++) try { if(sockets[j]!=null) sockets[j].close(); } catch(IOException ignored){}
     }
 }

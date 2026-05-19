@@ -1,46 +1,29 @@
 package batalhanaval.protocolo;
 
-/**
- * Representa uma mensagem do protocolo de comunicação.
- *
- * Serialização: "TIPO:dados\n"
- * Desserialização: lê uma linha e separa no primeiro ':'
- */
+/** Mensagem do protocolo. Formato: TIPO:dado1:dado2 */
 public class Mensagem {
     private final TipoMensagem tipo;
-    private final String dados;
+    private final String[] dados;
 
-    public Mensagem(TipoMensagem tipo, String dados) {
-        this.tipo = tipo;
-        this.dados = dados == null ? "" : dados;
+    public Mensagem(TipoMensagem tipo, String... dados) {
+        this.tipo = tipo; this.dados = dados;
     }
-    public Mensagem(TipoMensagem tipo) { this(tipo, ""); }
+    public TipoMensagem getTipo()   { return tipo; }
+    public String getDado(int i)    { return i < dados.length ? dados[i] : ""; }
+    public int numDados()           { return dados.length; }
 
-    public TipoMensagem getTipo() { return tipo; }
-    public String getDados()      { return dados; }
-
-    /** Converte para linha de texto para enviar pelo socket */
-    public String serializar() {
-        return dados.isEmpty() ? tipo.name() : tipo.name() + ":" + dados;
+    @Override public String toString() {
+        if (dados.length == 0) return tipo.name();
+        return tipo.name() + ":" + String.join(":", dados);
     }
 
-    /** Lê uma linha recebida e cria o objecto Mensagem correspondente */
-    public static Mensagem deserializar(String linha) {
+    public static Mensagem parse(String linha) {
         if (linha == null || linha.isBlank()) return null;
-        int idx = linha.indexOf(':');
-        try {
-            if (idx == -1) {
-                return new Mensagem(TipoMensagem.valueOf(linha.trim().toUpperCase()));
-            } else {
-                String tipoStr = linha.substring(0, idx).trim().toUpperCase();
-                String dados   = linha.substring(idx + 1);
-                return new Mensagem(TipoMensagem.valueOf(tipoStr), dados);
-            }
-        } catch (IllegalArgumentException e) {
-            System.err.println("[PROTOCOLO] Mensagem desconhecida: " + linha);
-            return null;
-        }
+        String[] p = linha.trim().split(":", -1);
+        TipoMensagem t = TipoMensagem.fromString(p[0]);
+        if (t == null) return null;
+        String[] d = new String[p.length-1];
+        System.arraycopy(p, 1, d, 0, d.length);
+        return new Mensagem(t, d);
     }
-
-    @Override public String toString() { return serializar(); }
 }

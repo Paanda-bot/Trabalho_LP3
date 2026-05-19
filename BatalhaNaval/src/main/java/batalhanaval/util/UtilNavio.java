@@ -1,51 +1,33 @@
 package batalhanaval.util;
-
-import batalhanaval.jogo.Navio;
-import batalhanaval.jogo.Tabuleiro;
-import batalhanaval.jogo.TipoNavio;
 import java.util.*;
 
-/** Utilitários para calcular células e serializar/deserializar posicionamentos */
+/** Calcula células de um navio dado posição + orientação */
 public class UtilNavio {
+    private UtilNavio() {}
 
-    public static List<String> calcularCelulas(String inicio, char orientacao, int tamanho) {
-        if (!Tabuleiro.celulaValida(inicio)) return null;
-        char linha = Character.toUpperCase(inicio.charAt(0));
-        int  coluna = Integer.parseInt(inicio.substring(1));
-        List<String> celulas = new ArrayList<>();
+    /**
+     * @param linha      ex: 'B'
+     * @param coluna     ex: 4
+     * @param tamanho    número de células
+     * @param orientacao 'H' ou 'V'
+     * @return células ex: ["B4","B5","B6"], vazio se sair fora dos limites
+     */
+    public static Set<String> calcularCelulas(char linha, int coluna, int tamanho, char orientacao) {
+        Set<String> c = new LinkedHashSet<>();
         for (int i = 0; i < tamanho; i++) {
-            String cel;
-            if (Character.toUpperCase(orientacao) == 'H') {
-                int nc = coluna + i;
-                if (nc > 10) return null;
-                cel = "" + linha + nc;
-            } else {
-                char nl = (char)(linha + i);
-                if (nl > 'J') return null;
-                cel = "" + nl + coluna;
-            }
-            if (!Tabuleiro.celulaValida(cel)) return null;
-            celulas.add(cel);
+            char l = orientacao=='V' ? (char)(linha+i) : linha;
+            int  col = orientacao=='H' ? coluna+i : coluna;
+            if (l<'A'||l>'J'||col<1||col>10) return new LinkedHashSet<>();
+            c.add(""+l+col);
         }
-        return celulas;
+        return c;
     }
 
-    public static Navio criarNavio(TipoNavio tipo, String inicio, char orientacao) {
-        List<String> celulas = calcularCelulas(inicio, orientacao, tipo.getTamanho());
-        return celulas == null ? null : new Navio(tipo, celulas);
-    }
-
-    public static String serializarPosicionamento(TipoNavio tipo, String inicio, char orientacao) {
-        return tipo.name() + ":" + inicio.toUpperCase() + ":" + Character.toUpperCase(orientacao);
-    }
-
-    public static Navio deserializarPosicionamento(String dados) {
-        if (dados == null) return null;
-        String[] p = dados.split(":");
-        if (p.length < 3) return null;
-        try {
-            TipoNavio tipo = TipoNavio.valueOf(p[0].toUpperCase());
-            return criarNavio(tipo, p[1].toUpperCase(), p[2].toUpperCase().charAt(0));
-        } catch (IllegalArgumentException e) { return null; }
+    /** @return [linha(char), coluna(int)] ou null */
+    public static Object[] parseCelula(String chave) {
+        if (chave==null||chave.length()<2) return null;
+        char l = Character.toUpperCase(chave.charAt(0));
+        try { return new Object[]{l, Integer.parseInt(chave.substring(1))}; }
+        catch (NumberFormatException e) { return null; }
     }
 }
